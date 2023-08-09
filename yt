@@ -1,0 +1,581 @@
+#!/usr/bin/python3
+
+import os
+import re
+import sys
+import json
+import platform
+import subprocess
+
+from time 			import sleep
+from threading      import Thread
+from urllib.parse   import quote   as encodeURL
+from urllib.parse   import unquote as decodeURL
+from urllib.request import urlopen as openURL
+from urllib.request import Request as requestURL
+
+
+class Decryption():
+
+	def __init__(self, js):
+		'''
+		( 1. ) We search for decryption sequence. It will look something like this:
+
+			sa=function(a){
+				a=a.split("");
+				DA.ss(a,4);					
+				DA.jM(a,6);					
+				DA.jM(a,45);				
+				DA.e0(a,3);				
+				return a.join("")
+				};
+
+		( 2. ) From the above sequence we want to focus on the following calls:
+
+				DA.ss(a,4);					
+				DA.jM(a,6);					
+				DA.jM(a,45);				
+				DA.e0(a,3);
+
+	    ( 3. ) We want to extract the following:
+
+			- 'DA'
+			- 'ss' and its argument '4'
+			- 'jM' and its argument '6'
+			- 'jM' and its argument '45'
+			- 'e0' and its argument '3'
+
+		( 4. ) The main object 'DA' will let us find function definitions. For example:
+
+			- 'ss' will correspond to a 'reverse()' function.
+			- 'jM' will correspond to a 'splice()' function.
+			- 'jM' will correspond to a 'splice()' function.
+			- 'e0' will correspond to a 'swap()' function.
+
+			All the core decryption functions: reverse(), splice(), swap() are re-implemented ahead of time
+			in python to match what their javascript counterparts would do. 
+
+		( 5. ) The final step is to map the sequence of functions and their arguments in python so it can
+			later be executed.
+
+		'''
+
+		self.js = js
+		
+
+		# ( 1. ) Overall decryption sequence.
+		self.calls = [ 
+
+			fn for fn in find(
+				
+				'\\w{2}=function\\(a\\){a=a\\.split\\(""\\)(?P<elements>.+?)return a\\.join\\(""\\)};', 
+				
+				self.js
+
+			)[1].split(';')[1:-1] 
+		]
+
+
+		# ( 2. ) + ( 3. ) Extract data.
+		self.sequence = {
+
+			'object'  : self.calls[0].split('.')[0],
+
+			'methods' : [ { 
+				'name': fn.split('.')[1].split('(')[0] ,
+				'arg' : int( fn.split(',')[1].split(')')[0] )
+
+			} for fn in self.calls ]
+		}
+
+
+		# ( 4. ) Find the definitions. 
+		self.definitions = find('var %s={(\\w{2}:function\\(a(,b)?\\){.+?},?\\n?)+};' %self.sequence['object'], self.js)[0]
+
+
+		# ( 5. ) Map method names to their decryption functions.
+		for method in self.sequence['methods']:
+
+			if method['name'] == find('(?P<name>\\w{2}):function\\(a\\){a\\.reverse\\(\\)}', self.definitions)["name"]:
+				
+				method.update({
+					'decrypt': Decryption.reverse
+				})
+
+			elif method['name'] == find('(?P<name>\\w{2}):function\\(a,b\\){var c=a\\[0\\];a\\[0\\]=a\\[b%a\\.length\\];a\\[b%a\\.length\\]=c}', self.definitions)["name"]:
+				
+				method.update({
+					'decrypt': Decryption.swap
+				})
+
+			elif method['name'] == find('(?P<name>\\w{2}):function\\(a,b\\){a.splice\\(0,b\\)}', self.definitions)["name"]:
+				
+				method.update({
+					'decrypt': Decryption.remove
+				})
+
+	def run(self, cipher):
+
+		cipher = list(cipher)
+
+		for method in self.sequence['methods']:
+			method['decrypt'](
+				cipher, 
+				method['arg']
+			)
+
+		return ''.join(cipher)
+
+	@staticmethod
+	def reverse(a, *args):
+		'''
+		A simple list reversal. 
+
+		Example:
+
+		[A, B, C, D, E, F] ---> [F, E, D, C, B, A]
+								 *  *  *  *  *  *
+		'''
+
+		return a.reverse()
+
+	@staticmethod
+	def swap(a, b):
+		'''
+		Two characters in a list will swap places. The first one and the N'th one.
+
+		Example:
+		
+		[A, B, C, D, E, F] ---> [D, B, C, A, E, F]
+								 *        *
+		'''
+
+		# Prepare.
+		nth = b % len(a)
+
+	    # Swap.
+		a[0], a[nth] = a[nth], a[0]
+
+	@staticmethod
+	def remove(a, b):
+		'''
+		Remove N amount of items from a list, starting at index 0.
+
+		Example:
+		
+		[A, B, C, D, E, F] ---> [C, D, E, F]
+
+		'''
+
+		del a[:b]
+
+
+class Youtube():
+
+	def __init__(self, url):
+
+		# Get the html from the url.
+		with openURL(url) as r:
+			self.html = r.read().decode()
+
+		# Get the video player javascript.
+		with openURL("https://www.youtube.com" + re.search('jsUrl":"(?P<url>.+?base.js)"', self.html)[1] ) as r:
+			self.js   = r.read().decode()
+
+		# Get title.
+		self.title = re.search('<meta name="title" content="(?P<title>.+?)">', self.html)[1]
+		self.title = self.title.replace('&amp;',  '&')  \
+							   .replace('&quot;', '"')  \
+							   .replace('&#39;',  '\'')
+
+		# Get all video/audio data as is.
+		self.data = re.search('var ytInitialPlayerResponse = (?P<ytInitialPlayerResponse>{.+("timestamp":){[^}]+}}+);', self.html)
+		self.data = self.data["ytInitialPlayerResponse"]
+	
+		# Load as json.
+		self.data = json.loads(self.data)
+
+		error = self.data.get('playabilityStatus')
+
+		if error.get('status') == "LOGIN_REQUIRED":
+			if error.get('reason') == "Sign in to confirm your age":
+				exit(f"\033[31mExiting. This video is age restricted (requires login).\033[0m")
+
+
+		# Pool all data together.
+		self.data = self.data['streamingData']['formats'] + self.data['streamingData']['adaptiveFormats']
+
+		# Seperate video/audio resources.
+		self.videos = list( filter(lambda m: ('video' in m['mimeType']), self.data) )
+		self.audios = list( filter(lambda m: ('audio' in m['mimeType']), self.data) )
+
+		# Sort video/audio resources based on quality. Highest to lowest. The higher the bitrate the higher the quality.
+		self.videos = sorted( self.videos, key=lambda m: m['bitrate'], reverse=True )
+		self.audios = sorted( self.audios, key=lambda m: m['bitrate'], reverse=True )
+
+		# Print title as is. It will later be processed to take care of any characters like &, ", $.
+		print("\nTitle:")
+		print(f"    \"{self.title}\"\n")
+
+	def bestQuality(self):
+
+		decryption = Decryption(self.js)
+
+		for media in [ self.videos[0], self.audios[0] ]:
+
+			# Split signatureCipher and media url into separate json key:value pairs.
+			if media.get('signatureCipher', None):
+				
+				media['signatureCipher'] = decodeURL(media['signatureCipher'])
+				
+				result = media['signatureCipher'].split('&sp=sig&url=')
+
+				# Remove the 's=' at the start of cipher string.
+				media['signatureCipher'] = result[0][2:] 
+
+				media.update({
+					'url': result[1]
+				})
+
+			# Get content length as integer.
+			if media.get('contentLength', None):
+				media['contentLength'] = int( media['contentLength'] )
+
+			else:
+				with openURL(media['url']) as r:
+					media.update({ 
+						'contentLength': int( r.info()['Content-Length'] )
+					})
+
+			# Decrypt cipher and prepare download url.
+			if media.get('signatureCipher', None):
+
+				media.update({ 
+					'decryptedCipher': decryption.run(media['signatureCipher']) 
+				})
+
+				media.update({ 
+					'download': media['url'] + "&alr=yes&sig=" + encodeURL(media['decryptedCipher']) 
+				})
+
+			else:
+				media.update({ 
+					'download': media['url']
+				})
+
+		# Title corrections, to avoid issues when saving to a file.
+		if   '/' in self.title:
+			title = self.title.replace('/', '_')
+
+		elif '&' in self.title:
+			title = self.title.replace('&', 'and')
+
+		elif '$' in self.title:
+			title = self.title.replace('$', 'S')
+		
+		elif '\"' in self.title:
+			title = self.title.replace('\"', '')
+		else:
+			title = self.title
+
+		return {
+			'title': title,
+			'video': self.videos[0],
+			'audio': self.audios[0]
+		}
+
+
+class Downloader():
+
+	DOWNLOAD_DIR = os.path.expanduser('~') + '/Downloads/'
+
+	@classmethod
+	def saveToFile(cls, filename, data_list):
+		with open(filename, 'wb') as f:
+			f.write( b''.join(data_list) )
+
+	@staticmethod
+	def checkRedirects(url):
+
+		redirects 		= 0
+		redirects_limit = 20
+
+		# print('Starting url:')
+		# print(url + '\n')
+
+		while True:
+
+			if redirects == redirects_limit:
+				exit(f"\033[31mExiting. Something weird is going on. The url keep redirecting. Redirects limit reached: {redirects_limit}\033[0m")
+
+			try:
+				req = requestURL(url)
+				res = openURL(req)
+			except Exception as e:
+				print(e)
+				print(url)
+				exit(1)
+
+			if res.headers.get_content_type() == 'text/plain':
+				redirects += 1
+
+				# print(f"Redirect #{redirects} to:")
+				body = res.read().decode()
+
+				for e in ['https://', 'googlevideo.com/']:
+					if e not in body:
+						exit(f"\033[31mExiting. Received garbage redirect.\033[0m")				
+
+				url = body
+
+				# print(url + '\n')
+
+			else:
+				break
+
+		# print("Final url:")
+		# print(url + '\n')
+
+		return url
+
+	@staticmethod
+	def download(url, result, index, start, end):
+		req = requestURL(url, headers={'Range' : 'bytes=%s-%s' % (start, end)})
+		res = openURL(req)
+		result[index] = res.read()
+
+	@staticmethod
+	def run(media, media_title):
+
+		try:
+			# Redirects.
+			url = Downloader.checkRedirects(media['download'])
+
+			# Threads.
+			threads     = []
+			max_threads = 50
+			
+			# Buffer and download range of each part.
+			buffer = 100000
+			starts = [ start for start in range(0,        media['contentLength']-1, buffer) ]
+			ends   = [ end   for end   in range(buffer-1, media['contentLength']-1, buffer) ]
+			ends.append( media['contentLength']-1 )
+
+			# Result storage.
+			parts    	= [b''] * len(ends)
+			parts_count = len(parts)
+
+			# Info.
+			if 'video' in media['mimeType']:
+				mimeType = "Video"
+
+			elif 'audio' in media['mimeType']:
+				mimeType = "Audio"				
+
+			else:
+				mimeType = "Unknown type"
+
+			# Run.
+			for i in range(0, parts_count):
+
+				# Prepare threads
+				threads.append(
+					Thread(
+						target=Downloader.download,
+						args=(
+							url,
+							parts,
+							i,
+							starts[i],
+							ends[i],
+				)))
+
+				# Count total remaining parts.
+				parts_remaining = parts.count(b'')
+
+				if parts_remaining < max_threads:
+					max_threads = parts_remaining
+
+				# Download.
+				if max_threads == len(threads):
+
+					percent_completed = int( ( parts_count + max_threads - parts_remaining ) / parts_count * 100 )
+
+					print(f"\033[33m- {mimeType} download:\033[0m {percent_completed:3} %", end='\r', flush=True)
+
+					for t in threads:
+						t.start()
+
+					for t in threads:
+						t.join()
+
+					threads.clear()
+
+			print('')
+			Downloader.saveToFile(media_title, parts)
+
+		except KeyboardInterrupt:
+			exit("\n\n\033[31mDownload cancelled by user.\033[0m")
+
+
+class Renderer():
+
+	@staticmethod
+	def getDuration(ms):
+
+		ms 		= int( ms )
+		seconds	= int( ms / (1000) % 60 )
+		minutes	= int( ms / (1000*60) % 60 )
+		hours	= int( ms / (1000*60*60) % 24 )
+
+		return f"{hours:02}:{minutes:02}:{seconds:02}"
+
+	@staticmethod
+	def run(video, audio, media):
+
+		video_length = Renderer.getDuration(media['video']['approxDurationMs'])
+
+		cmd = [
+				'ffmpeg', 
+				'-i', video, 
+				'-i', audio, 
+				'-c:v', 'libx264',
+				'-c:a', 'aac',
+				'-progress', '-', '-nostats',
+				'-loglevel', 'error',
+				'-y', # Overwrite existing file
+				media['file']
+			]
+
+		print('--------------------------------------------')
+
+		try:
+			p = subprocess.Popen(
+					cmd,
+					stdout=subprocess.PIPE,
+					stderr=subprocess.PIPE,
+					universal_newlines=False,
+				)
+
+			while True:
+
+				line = p.stdout.readline().decode()
+
+				if not line:
+					print('')
+					return
+
+				if "out_time=" in line:
+
+					if '-' in line:
+						continue
+
+					position = line.split('=')[1].split('.')[0]
+
+					print(f"\033[33mRendering:\033[0m {position} of {video_length}", end='\r', flush=True)
+
+		except KeyboardInterrupt:
+			os.remove(media['file'])
+			exit("\n\n\033[31mRendering cancelled by user.\033[0m")
+
+		finally:
+			os.remove(video)
+			os.remove(audio)
+
+
+def find(regex, target):
+
+	result = re.search(regex, target)
+
+	if not result:
+ 		exit(f"\n\033[31mCouldn't find regex pattern:\033[0m\n    {regex}")
+
+	return result
+
+
+def arguments(argv):
+
+	# REQUIRED
+	if not len(argv) >= 2 or 'https://www.youtube.com/' not in argv[1]:
+		print("Usage: ")
+		print(f"{argv[0]} <url>")
+		print(f"{argv[0]} <url> --video-only")
+		print(f"{argv[0]} <url> --audio-only")
+		exit(1)
+
+	result = {
+		'url': argv[1],
+		'--video-only': False,
+		'--audio-only': False,
+	}
+
+	# OPTIONAL
+	if len(argv) == 3:
+		if   '--video-only' == argv[2]:
+			result['--video-only'] = True
+
+		elif '--audio-only' == argv[2]:
+			result['--audio-only'] = True
+
+	return result
+
+
+def print_json(data):
+	print(json.dumps(data, indent=4))
+
+
+def check_sys_requirements():
+
+	if "Linux" != platform.system():
+		exit("\n\033[31mThis script is currently only tested to run on Linux.\n\nSorry :(\033[0m")
+
+	if "3" != platform.python_version_tuple()[0]:
+		exit("\n\033[31mThis script is currently only tested to run on Python 3.\n\nSorry :(\033[0m")		
+
+	try:
+		subprocess.run(
+			["ffmpeg", "--help"], 
+			stdout=subprocess.DEVNULL, 
+			stderr=subprocess.DEVNULL, 
+			check=True
+		)
+	except FileNotFoundError:
+	 	exit("\n\033[31mRequirement: 'ffmpeg' not found. Please install it first.\033[0m")
+
+
+if __name__ == "__main__":
+
+	# SYSTEM STUFF
+	check_sys_requirements()
+
+	args   = arguments(sys.argv)
+
+	# YOUTUBE 
+	media  = Youtube(args['url']).bestQuality()
+
+	# DOWNLOAD
+	media.update({"file" : Downloader.DOWNLOAD_DIR + media['title'] + '.mp4'})
+
+	if   args['--video-only']:
+		print("Quality:")
+		print(f"    {media['video']['qualityLabel']}\n")
+
+		Downloader.run(media['video'], media['file'])
+
+	elif args['--audio-only']:
+		Downloader.run(media['audio'], media['file'])
+
+	else:
+		print("Quality:")
+		print(f"    {media['video']['qualityLabel']}\n")
+
+		Downloader.run(media['video'], Downloader.DOWNLOAD_DIR + 'tmp_video.mp4')
+		Downloader.run(media['audio'], Downloader.DOWNLOAD_DIR + 'tmp_audio.mp4')
+
+		Renderer.run(
+			Downloader.DOWNLOAD_DIR + 'tmp_video.mp4', 
+			Downloader.DOWNLOAD_DIR + 'tmp_audio.mp4', 
+			media
+		)
+
+	print(f"\n\033[32mCompleted:\033[0m \"{media['file']}\"")
