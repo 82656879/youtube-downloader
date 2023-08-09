@@ -7,6 +7,7 @@ Youtube downloader that actually works.
 - Fast & multi-threaded downloads.
 - See live progress for downloads & rendering.
 - Download video or audio exclusively.
+- Built from ground up. This is NOT just a simple wrapper around youtube-dl.
 
 ### Compatibility (only tested on):
 - Python3
