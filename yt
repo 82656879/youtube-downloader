@@ -482,6 +482,30 @@ class Renderer():
 			os.remove(video)
 			os.remove(audio)
 
+	@staticmethod
+	def run_audio(media):
+
+		in_file = media['file']
+
+		media['file'] = media['file'].replace('.mp4', '.wav')
+
+		cmd = [
+				'ffmpeg', 
+				'-i', in_file, 
+				'-ac', '2',
+				'-f', 'wav',
+				'-loglevel', 'error',
+				'-y', # Overwrite existing file
+				media['file']
+			]
+
+		print('--------------------------------------------')
+		print(f"\033[33mRendering:\033[0m...", end='\r', flush=True)
+
+		subprocess.run(cmd)
+
+		os.remove(in_file)
+
 
 def find(regex, target):
 
@@ -564,6 +588,9 @@ if __name__ == "__main__":
 
 	elif args['--audio-only']:
 		Downloader.run(media['audio'], media['file'])
+		Renderer.run_audio(
+			media
+			)
 
 	else:
 		print("Quality:")
